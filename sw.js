@@ -1,4 +1,4 @@
-const CACHE_NAME = 'br-lux-survey-v4';
+const CACHE_NAME = 'br-lux-survey-v5';
 const ASSETS = [
   './index.html',
   './manifest.json',
