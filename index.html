@@ -721,7 +721,10 @@
     if(rec.meta) out.meta = Object.assign(emptyMeta(), rec.meta);
     if(Array.isArray(rec.areas)){
       out.areas = rec.areas.map(function(a){
-        var newId = uid();
+        // Preserve the incoming id when the file provides one (e.g. a
+        // photo pack references these ids to attach photos later) --
+        // only generate a fresh one if the area didn't already have it.
+        var newId = (typeof a.id === 'string' && a.id) ? a.id : uid();
         var merged = Object.assign({ name:"", fittingType:"", condition:"", target:"", max:"", min:"", avg:"", compliant:null, comments:"", photo:null }, a, { id: newId });
         var dataUrl = null;
         if(typeof merged.photoData === 'string' && merged.photoData.indexOf('data:') === 0) dataUrl = merged.photoData;
