@@ -385,11 +385,13 @@
     <div class="grabber"></div>
     <div class="sheet-title">Saved reports</div>
     <div class="reports-list" id="reportsList"></div>
+    <button id="importReportBtn">⬆️ Import report from file</button>
     <button class="cancel" id="closeReportsSheet">Close</button>
   </div>
 </div>
 
 <input type="file" accept="image/*" capture="environment" id="cameraInput" style="display:none;">
+<input type="file" accept="application/json,.json" id="importInput" style="display:none;">
 <input type="file" accept="image/*" id="libraryInput" style="display:none;">
 
 <div class="toast" id="toast"></div>
@@ -641,6 +643,56 @@
   document.getElementById('closeReportsSheet').addEventListener('click', closeReportsSheet);
   document.getElementById('reportsSheet').addEventListener('click', function(e){
     if(e.target === this) closeReportsSheet();
+  });
+
+  // ---------- import report(s) from JSON file ----------
+  function normalizeImportedReport(rec){
+    var out = newReportRecord();
+    if(rec.meta) out.meta = Object.assign(emptyMeta(), rec.meta);
+    if(Array.isArray(rec.areas)){
+      out.areas = rec.areas.map(function(a){
+        return Object.assign({ id: uid(), name:"", fittingType:"", condition:"", target:"", max:"", min:"", avg:"", compliant:null, comments:"", photo:null }, a, { id: uid() });
+      });
+    }
+    if(rec.createdAt) out.createdAt = rec.createdAt;
+    out.updatedAt = Date.now();
+    return out;
+  }
+
+  document.getElementById('importReportBtn').addEventListener('click', function(){
+    document.getElementById('importInput').click();
+  });
+  document.getElementById('importInput').addEventListener('change', function(){
+    var file = this.files[0];
+    this.value = '';
+    if(!file) return;
+    var reader = new FileReader();
+    reader.onload = function(ev){
+      var parsed;
+      try{
+        parsed = JSON.parse(ev.target.result);
+      }catch(e){
+        toast('That file is not valid JSON');
+        return;
+      }
+      var incoming = Array.isArray(parsed.reports) ? parsed.reports : [parsed];
+      var imported = [];
+      incoming.forEach(function(rec){
+        if(!rec || typeof rec !== 'object') return;
+        var out = normalizeImportedReport(rec);
+        reports.push(out);
+        imported.push(out);
+      });
+      if(imported.length === 0){
+        toast('No report data found in that file');
+        return;
+      }
+      switchToReport(imported[0].id);
+      renderReportsList();
+      closeReportsSheet();
+      toast(imported.length === 1 ? 'Imported "' + reportTitle(imported[0]) + '"' : 'Imported ' + imported.length + ' reports');
+    };
+    reader.readAsText(file);
   });
 
   function hydrateMetaFields(){
