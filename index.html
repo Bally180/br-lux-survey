@@ -470,6 +470,56 @@
     t._h = setTimeout(function(){ t.classList.remove('show'); }, 1600);
   }
 
+  // ---------- photo storage (IndexedDB) ----------
+  // Photos are kept out of localStorage (which has a very small quota on
+  // mobile Safari) and stored here instead, keyed by area id. Areas only
+  // carry a boolean `photo` flag; the actual image bytes live in this DB.
+  var PHOTO_DB_NAME = 'br-lux-survey-photos';
+  var PHOTO_STORE = 'photos';
+  var photoDbPromise = null;
+  function openPhotoDb(){
+    if(photoDbPromise) return photoDbPromise;
+    photoDbPromise = new Promise(function(resolve, reject){
+      var req = indexedDB.open(PHOTO_DB_NAME, 1);
+      req.onupgradeneeded = function(){
+        req.result.createObjectStore(PHOTO_STORE);
+      };
+      req.onsuccess = function(){ resolve(req.result); };
+      req.onerror = function(){ reject(req.error); };
+    });
+    return photoDbPromise;
+  }
+  function photoPut(id, dataUrl){
+    return openPhotoDb().then(function(db){
+      return new Promise(function(resolve, reject){
+        var tx = db.transaction(PHOTO_STORE, 'readwrite');
+        tx.objectStore(PHOTO_STORE).put(dataUrl, id);
+        tx.oncomplete = function(){ resolve(); };
+        tx.onerror = function(){ reject(tx.error); };
+      });
+    });
+  }
+  function photoGet(id){
+    return openPhotoDb().then(function(db){
+      return new Promise(function(resolve, reject){
+        var tx = db.transaction(PHOTO_STORE, 'readonly');
+        var req = tx.objectStore(PHOTO_STORE).get(id);
+        req.onsuccess = function(){ resolve(req.result || null); };
+        req.onerror = function(){ reject(req.error); };
+      });
+    });
+  }
+  function photoDelete(id){
+    return openPhotoDb().then(function(db){
+      return new Promise(function(resolve, reject){
+        var tx = db.transaction(PHOTO_STORE, 'readwrite');
+        tx.objectStore(PHOTO_STORE).delete(id);
+        tx.oncomplete = function(){ resolve(); };
+        tx.onerror = function(){ reject(tx.error); };
+      });
+    });
+  }
+
   var REPORTS_KEY = 'br-lux-survey-reports';
   var LEGACY_KEY = 'lux-app-data';
 
@@ -527,6 +577,20 @@
     state.areas = rec.areas || [];
     hydrateMetaFields();
     renderAreas();
+    migrateInlinePhotos(state.areas);
+  }
+
+  // Older saves (or an old version of the app) may still have the raw photo
+  // data URL sitting directly on the area instead of in IndexedDB. Move it
+  // out in the background so it stops eating into the localStorage quota.
+  function migrateInlinePhotos(areas){
+    var pending = areas.filter(function(a){
+      return typeof a.photo === 'string' && a.photo.indexOf('data:') === 0;
+    });
+    if(pending.length === 0) return;
+    Promise.all(pending.map(function(a){
+      return photoPut(a.id, a.photo).then(function(){ a.photo = true; });
+    })).then(function(){ saveState(); });
   }
 
   function persistReports(){
@@ -562,6 +626,7 @@
     hydrateMetaFields();
     renderAreas();
     persistReports();
+    migrateInlinePhotos(state.areas);
   }
 
   function reportTitle(rec){
@@ -646,12 +711,29 @@
   });
 
   // ---------- import report(s) from JSON file ----------
-  function normalizeImportedReport(rec){
+  // `photoTasks` collects IndexedDB writes for any embedded photo data so
+  // the caller can wait for them before switching into the imported report.
+  // An area can carry its photo either as `photoData` (dedicated field) or
+  // as a raw data: URL directly in `photo` -- both are moved into IndexedDB
+  // and never touch localStorage.
+  function normalizeImportedReport(rec, photoTasks){
     var out = newReportRecord();
     if(rec.meta) out.meta = Object.assign(emptyMeta(), rec.meta);
     if(Array.isArray(rec.areas)){
       out.areas = rec.areas.map(function(a){
-        return Object.assign({ id: uid(), name:"", fittingType:"", condition:"", target:"", max:"", min:"", avg:"", compliant:null, comments:"", photo:null }, a, { id: uid() });
+        var newId = uid();
+        var merged = Object.assign({ name:"", fittingType:"", condition:"", target:"", max:"", min:"", avg:"", compliant:null, comments:"", photo:null }, a, { id: newId });
+        var dataUrl = null;
+        if(typeof merged.photoData === 'string' && merged.photoData.indexOf('data:') === 0) dataUrl = merged.photoData;
+        else if(typeof merged.photo === 'string' && merged.photo.indexOf('data:') === 0) dataUrl = merged.photo;
+        delete merged.photoData;
+        if(dataUrl){
+          photoTasks.push(photoPut(newId, dataUrl));
+          merged.photo = true;
+        } else {
+          merged.photo = null;
+        }
+        return merged;
       });
     }
     if(rec.createdAt) out.createdAt = rec.createdAt;
@@ -677,9 +759,10 @@
       }
       var incoming = Array.isArray(parsed.reports) ? parsed.reports : [parsed];
       var imported = [];
+      var photoTasks = [];
       incoming.forEach(function(rec){
         if(!rec || typeof rec !== 'object') return;
-        var out = normalizeImportedReport(rec);
+        var out = normalizeImportedReport(rec, photoTasks);
         reports.push(out);
         imported.push(out);
       });
@@ -687,10 +770,19 @@
         toast('No report data found in that file');
         return;
       }
-      switchToReport(imported[0].id);
-      renderReportsList();
-      closeReportsSheet();
-      toast(imported.length === 1 ? 'Imported "' + reportTitle(imported[0]) + '"' : 'Imported ' + imported.length + ' reports');
+      if(photoTasks.length) toast('Importing ' + photoTasks.length + ' photos…');
+      Promise.all(photoTasks).then(function(){
+        switchToReport(imported[0].id);
+        renderReportsList();
+        closeReportsSheet();
+        toast(imported.length === 1 ? 'Imported "' + reportTitle(imported[0]) + '"' : 'Imported ' + imported.length + ' reports');
+      }).catch(function(e){
+        console.error('Photo import failed', e);
+        switchToReport(imported[0].id);
+        renderReportsList();
+        closeReportsSheet();
+        toast('Imported, but some photos failed to save');
+      });
     };
     reader.readAsText(file);
   });
@@ -827,7 +919,7 @@
 
       html += '    <label style="display:block; font-size:12px; color:var(--ink-soft); font-weight:600; margin-bottom:4px;">Photo</label>';
       if(a.photo){
-        html += '    <div class="photo-zone has-photo" data-photo="'+a.id+'"><img src="'+a.photo+'"></div>';
+        html += '    <div class="photo-zone has-photo" data-photo="'+a.id+'"><img data-photoid="'+a.id+'" alt=""></div>';
         html += '    <div class="photo-actions"><button class="btn btn-outline btn-sm" data-photo="'+a.id+'">Retake / change</button><button class="btn btn-danger-ghost btn-sm" data-removephoto="'+a.id+'">Remove photo</button></div>';
       } else {
         html += '    <div class="photo-zone" data-photo="'+a.id+'"><span class="icon">📷</span><span class="hint">Tap to attach a photo of this area</span></div>';
@@ -841,6 +933,16 @@
     });
     list.innerHTML = html;
     bindAreaEvents();
+    hydratePhotoImages();
+  }
+
+  function hydratePhotoImages(){
+    document.querySelectorAll('img[data-photoid]').forEach(function(img){
+      var id = img.getAttribute('data-photoid');
+      var a = state.areas.find(function(x){ return x.id === id; });
+      if(a && typeof a.photo === 'string'){ img.src = a.photo; return; }
+      photoGet(id).then(function(dataUrl){ if(dataUrl) img.src = dataUrl; });
+    });
   }
 
   function bindAreaEvents(){
@@ -901,11 +1003,12 @@
         e.stopPropagation();
         var id = this.getAttribute('data-removephoto');
         var a = state.areas.find(function(x){return x.id===id;});
-        a.photo = null;
-        saveState();
-        renderAreas();
-        openAreaId = id;
-        renderAreas();
+        photoDelete(id).then(function(){
+          a.photo = null;
+          saveState();
+          openAreaId = id;
+          renderAreas();
+        });
       });
     });
   }
@@ -942,11 +1045,13 @@
         var dataUrl = canvas.toDataURL('image/jpeg', 0.72);
         var a = state.areas.find(function(x){return x.id===activePhotoAreaId;});
         if(a){
-          a.photo = dataUrl;
-          saveState();
-          openAreaId = a.id;
-          renderAreas();
-          toast('Photo attached');
+          photoPut(a.id, dataUrl).then(function(){
+            a.photo = true;
+            saveState();
+            openAreaId = a.id;
+            renderAreas();
+            toast('Photo attached');
+          });
         }
       };
       img.src = ev.target.result;
@@ -980,16 +1085,17 @@
       toast('Add at least one area first');
       return;
     }
-    buildReport();
-    window.onafterprint = function(){
-      document.getElementById('reportView').style.display = 'none';
-      document.getElementById('mainApp').style.display = 'block';
-      document.querySelector('.bottombar').style.display = 'flex';
-    };
-    document.getElementById('mainApp').style.display = 'none';
-    document.querySelector('.bottombar').style.display = 'none';
-    document.getElementById('reportView').style.display = 'block';
-    setTimeout(function(){ window.print(); }, 200);
+    buildReport().then(function(){
+      window.onafterprint = function(){
+        document.getElementById('reportView').style.display = 'none';
+        document.getElementById('mainApp').style.display = 'block';
+        document.querySelector('.bottombar').style.display = 'flex';
+      };
+      document.getElementById('mainApp').style.display = 'none';
+      document.querySelector('.bottombar').style.display = 'none';
+      document.getElementById('reportView').style.display = 'block';
+      setTimeout(function(){ window.print(); }, 200);
+    });
   });
 
   function fmtDate(d){
@@ -1000,6 +1106,17 @@
   }
 
   function buildReport(){
+    var photoMap = {};
+    return Promise.all(state.areas.map(function(a){
+      if(!a.photo) return null;
+      if(typeof a.photo === 'string'){ photoMap[a.id] = a.photo; return null; }
+      return photoGet(a.id).then(function(dataUrl){ if(dataUrl) photoMap[a.id] = dataUrl; });
+    })).then(function(){
+      renderReportHtml(photoMap);
+    });
+  }
+
+  function renderReportHtml(photoMap){
     var m = state.meta;
     var html = '';
     html += '<div class="rp-header"><img src="'+LOGO+'"><div><div class="co">B&amp;R ELECTRICAL</div><div class="sub">ABN 35 669 511 504 · REC 32656 · info@bandrelectrical.com.au</div></div></div>';
@@ -1059,8 +1176,8 @@
       if(a.comments){
         html += '<div class="rp-comments"><b>Comments: </b>'+escapeHtml(a.comments)+'</div>';
       }
-      if(a.photo){
-        html += '<img class="rp-photo" src="'+a.photo+'">';
+      if(photoMap[a.id]){
+        html += '<img class="rp-photo" src="'+photoMap[a.id]+'">';
       } else {
         html += '<div class="rp-nophoto">No photo attached</div>';
       }
