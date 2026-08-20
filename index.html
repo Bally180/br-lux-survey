@@ -757,6 +757,39 @@
         toast('That file is not valid JSON');
         return;
       }
+
+      // A "photo pack" attaches photos to areas that already exist (by id)
+      // in an already-imported report, rather than importing a report of
+      // its own. Used to split a large photo-heavy import into smaller
+      // files that stay under the file-transfer size limit.
+      if(parsed && parsed.photoPack === true && Array.isArray(parsed.photos)){
+        var tasks = [];
+        var matched = 0, missed = 0;
+        parsed.photos.forEach(function(p){
+          if(!p || !p.areaId || !p.photoData) return;
+          var found = null;
+          reports.forEach(function(r){
+            (r.areas||[]).forEach(function(a){ if(a.id === p.areaId) found = a; });
+          });
+          if(!found){ missed++; return; }
+          matched++;
+          tasks.push(photoPut(p.areaId, p.photoData).then(function(){ found.photo = true; }));
+        });
+        if(matched === 0){
+          toast('No matching areas found — import the report first');
+          return;
+        }
+        toast('Attaching ' + matched + ' photos…');
+        Promise.all(tasks).then(function(){
+          persistReports();
+          renderAreas();
+          renderReportsList();
+          closeReportsSheet();
+          toast('Attached ' + matched + ' photos' + (missed ? ' (' + missed + ' not matched)' : ''));
+        });
+        return;
+      }
+
       var incoming = Array.isArray(parsed.reports) ? parsed.reports : [parsed];
       var imported = [];
       var photoTasks = [];
